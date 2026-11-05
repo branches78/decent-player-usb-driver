@@ -74,6 +74,17 @@ struct UsbAudioContext {
     int32_t bytesPerFrame;
     int32_t maxPacketSize;
 
+    /**
+     * USB packets per second. High speed (USB 2.0 DACs) sends one packet
+     * per 125 us microframe (8000/s); full speed (USB 1.1, e.g. cheap USB-C earphones)
+     * one per 1 ms frame (1000/s). "fpmf" below is frames per packet.
+     */
+    int32_t packetsPerSec;
+    /** URBs kept in flight (~80 ms high speed, ~160 ms full speed). */
+    int32_t maxInFlight;
+    /** URBs submitted since start (underrun diagnostics). */
+    int64_t urbsSubmitted;
+
     std::atomic<bool> running;
 
     /** Scratch buffer for PCM format conversion (float -> int16/24/32). */
@@ -151,3 +162,9 @@ void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples);
 
 /** int32 (24-bit sign-extended from libFLAC) → 32-bit: shift left 8. */
 void shiftInt32From24(const uint8_t *src, uint8_t *dst, int numSamples);
+
+/** Conversions for DACs whose USB slot is 3 or 2 bytes (common in UAC1). */
+void padInt16ToInt24(const uint8_t *src, uint8_t *dst, int numSamples);
+void packInt32From24(const uint8_t *src, uint8_t *dst, int numSamples);
+void truncInt24ToInt16(const uint8_t *src, uint8_t *dst, int numSamples);
+void truncInt32From24ToInt16(const uint8_t *src, uint8_t *dst, int numSamples);

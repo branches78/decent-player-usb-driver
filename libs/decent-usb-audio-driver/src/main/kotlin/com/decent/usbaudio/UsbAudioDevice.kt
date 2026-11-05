@@ -261,9 +261,19 @@ class UsbAudioDevice private constructor(private val context: Context) {
 
         // Auto-detect Clock Source ID and best alt setting from USB descriptors
         val clockSourceId = parseClockSourceId(conn)
-        val (bestAlt, bestBits) = parseBestAltSetting(conn)
-        Log.i(TAG, "Auto-detected: clockSourceId=0x${clockSourceId.toString(16)}, " +
-                "bestAlt=$bestAlt, bestBits=$bestBits")
+        val formats = parseFormats(conn, interfaceId)
+        parsedAltSettings = formats.map { it.alt to it.bits }
+        // The alt with the highest resolution. The native side packs samples in the USB slot
+        // size (2, 3 or 4 bytes), so that is the bit depth it gets: a UAC1 24-bit alt uses
+        // 3-byte slots, and sending it 16-bit samples was pure noise.
+        val best = formats.maxWithOrNull(compareBy({ it.bits }, { it.subslot }))
+        val bestAlt = best?.alt ?: 1
+        val bestBits = best?.let { if (it.subslot in 2..4) it.subslot * 8 else it.bits } ?: 16
+        val uac1 = formats.firstOrNull()?.uac1 ?: (clockSourceId < 0)
+        if (best != null && best.maxPacket > 0) maxPacketSize = best.maxPacket
+        Log.i(TAG, "Auto-detected: clockSourceId=0x${clockSourceId.toString(16)}, uac1=$uac1, " +
+                "bestAlt=$bestAlt, bestBits=$bestBits, maxPacket=$maxPacketSize, " +
+                "formats=${formats.joinToString { "alt${it.alt}:${it.bits}/${it.subslot}B ${it.rates}" }}")
 
         val info = UsbAudioDeviceInfo(
                 connection = conn,
@@ -276,7 +286,8 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 altSettingCount = altSettingCount,
                 clockSourceId = clockSourceId,
                 bestAltSetting = bestAlt,
-                bestBitDepth = bestBits
+                bestBitDepth = bestBits,
+                uac1 = uac1,
         )
         cachedDeviceInfo = info
         return info
@@ -354,68 +365,69 @@ class UsbAudioDevice private constructor(private val context: Context) {
         return -1
     }
 
-    /**
-     * Parse raw USB descriptors to find the best (highest bit depth) alt setting
-     * for the AudioStreaming interface.
-     *
-     * Scans AS Format Type I descriptors (CS_INTERFACE 0x02) for bBitResolution
-     * and returns the alt setting with the highest value.
-     *
-     * @return Pair(altSetting, bitDepth), or Pair(1, 16) as default.
-     */
     /** Parsed alt setting: (altNumber, bitResolution) */
     private var parsedAltSettings: List<Pair<Int, Int>> = emptyList()
 
-    private fun parseBestAltSetting(conn: UsbDeviceConnection): Pair<Int, Int> {
-        val raw = conn.rawDescriptors ?: return Pair(1, 16)
-        val altSettings = mutableListOf<Pair<Int, Int>>()
+    /**
+     * one alt setting of the output streaming interface.
+     * [subslot] is the bytes each sample takes on the bus, [bits] its resolution, [rates]
+     * the rates its Format Type I descriptor lists (UAC1 only; UAC2 reads them with GET RANGE).
+     */
+    private class AltFormat(
+        val alt: Int, val subslot: Int, val bits: Int, val rates: List<IntRange>,
+        val maxPacket: Int, val uac1: Boolean,
+    )
 
+    /**
+     * Format Type I of each alt setting of streaming interface [ifaceId] (the
+     * output one; a headset's microphone interface is skipped). The descriptor differs by
+     * class version, told by the interface's bInterfaceProtocol (0x20 = UAC2):
+     * - UAC2: bSubslotSize at 4, bBitResolution at 5.
+     * - UAC1: bNrChannels at 4, bSubframeSize at 5, bBitResolution at 6, then the rates
+     *   (bSamFreqType at 7: 0 = continuous min..max, N = N discrete 3-byte rates).
+     * Reading a UAC1 descriptor as UAC2 gave "2 channels / 3 bits": the driver fell back to
+     * 16 bits on a 24-bit alt.
+     */
+    private fun parseFormats(conn: UsbDeviceConnection, ifaceId: Int): List<AltFormat> {
+        val raw = conn.rawDescriptors ?: return emptyList()
+        val out = mutableListOf<AltFormat>()
         var i = 0
-        var currentAlt = 0
-        var inAudioStreaming = false
-        var bestAlt = 1
-        var bestBits = 16
-
+        var inIface = false
+        var alt = 0
+        var uac1 = true
+        var pending: AltFormat? = null
+        fun u8(at: Int) = raw[at].toInt() and 0xFF
+        fun u24(at: Int) = u8(at) or (u8(at + 1) shl 8) or (u8(at + 2) shl 16)
         while (i + 1 < raw.size) {
-            val bLength = raw[i].toInt() and 0xFF
-            if (bLength < 2) break
-            if (i + bLength > raw.size) break
-
-            val bDescriptorType = raw[i + 1].toInt() and 0xFF
-
-            // Interface descriptor (0x04)
-            if (bDescriptorType == 0x04 && bLength >= 9) {
-                val bInterfaceClass = raw[i + 5].toInt() and 0xFF
-                val bInterfaceSubClass = raw[i + 6].toInt() and 0xFF
-                val bAlternateSetting = raw[i + 3].toInt() and 0xFF
-                inAudioStreaming = (bInterfaceClass == 1 && bInterfaceSubClass == 2)
-                if (inAudioStreaming) currentAlt = bAlternateSetting
+            val len = u8(i)
+            if (len < 2 || i + len > raw.size) break
+            val type = u8(i + 1)
+            if (type == 0x04 && len >= 9) {
+                pending?.let { out += it }; pending = null
+                inIface = u8(i + 2) == ifaceId && u8(i + 5) == 1 && u8(i + 6) == 2
+                alt = u8(i + 3)
+                if (inIface) uac1 = u8(i + 7) != 0x20
+            } else if (inIface && alt > 0 && type == 0x24 && len >= 6 && u8(i + 2) == 0x02) {
+                pending = if (uac1 && len >= 8) {
+                    val n = u8(i + 7)
+                    val rates = when {
+                        n == 0 && len >= 14 -> listOf(u24(i + 8)..u24(i + 11))
+                        else -> (0 until n).mapNotNull { k ->
+                            val at = i + 8 + 3 * k
+                            if (at + 3 <= i + len) u24(at).let { it..it } else null
+                        }
+                    }.filter { it.first > 0 && it.last >= it.first }
+                    AltFormat(alt, u8(i + 5), u8(i + 6), rates, 0, true)
+                } else AltFormat(alt, u8(i + 4), u8(i + 5), emptyList(), 0, false)
+                Log.i(TAG, "parseFormats: alt=$alt uac1=$uac1 subslot=${pending.subslot} bits=${pending.bits} rates=${pending.rates}")
+            } else if (inIface && type == 0x05 && len >= 7 && (u8(i + 2) and 0x80) == 0) {
+                // OUT endpoint of this alt: its wMaxPacketSize.
+                pending = pending?.let { AltFormat(it.alt, it.subslot, it.bits, it.rates, (u8(i + 4) or (u8(i + 5) shl 8)) and 0x7FF, it.uac1) }
             }
-
-            // CS_INTERFACE (0x24) in AudioStreaming — Format Type I (subtype 0x02)
-            if (inAudioStreaming && bDescriptorType == 0x24 && bLength >= 6) {
-                val bDescriptorSubtype = raw[i + 2].toInt() and 0xFF
-                if (bDescriptorSubtype == 0x02) {
-                    val bSubslotSize = raw[i + 4].toInt() and 0xFF
-                    val bBitResolution = raw[i + 5].toInt() and 0xFF
-                    Log.i(TAG, "parseBestAltSetting: alt=$currentAlt subslotSize=$bSubslotSize bitResolution=$bBitResolution")
-
-                    if (currentAlt > 0) {
-                        altSettings.add(Pair(currentAlt, bBitResolution))
-                    }
-                    if (bBitResolution > bestBits && currentAlt > 0) {
-                        bestBits = bBitResolution
-                        bestAlt = currentAlt
-                    }
-                }
-            }
-
-            i += bLength
+            i += len
         }
-
-        parsedAltSettings = altSettings
-        Log.i(TAG, "parseBestAltSetting: best alt=$bestAlt bits=$bestBits, all=$altSettings")
-        return Pair(bestAlt, bestBits)
+        pending?.let { out += it }
+        return out
     }
 
     /**
@@ -483,6 +495,17 @@ class UsbAudioDevice private constructor(private val context: Context) {
      */
     fun setSampleRate(sampleRateHz: Int): Boolean {
         val conn = connection ?: return false
+
+        // UAC1 has no Clock Source; the rate is the endpoint's
+        // SAMPLING_FREQ_CONTROL (bmRequestType 0x22, wIndex = endpoint, 3 bytes). The UAC2
+        // request below was "accepted" by some UAC1 earphones and ignored: they kept their
+        // own rate while the driver sent another.
+        cachedDeviceInfo?.takeIf { it.uac1 }?.let { info ->
+            val d = byteArrayOf(sampleRateHz.toByte(), (sampleRateHz shr 8).toByte(), (sampleRateHz shr 16).toByte())
+            val ret = conn.controlTransfer(0x22, 0x01, 0x0100, info.endpointOutAddress, d, 3, 1000)
+            Log.i(TAG, "setSampleRate($sampleRateHz Hz) UAC1 endpoint 0x${info.endpointOutAddress.toString(16)}: ret=$ret")
+            return ret >= 0
+        }
 
         val data = ByteArray(4)
         data[0] = (sampleRateHz and 0xFF).toByte()
@@ -568,6 +591,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
      */
     fun readClockValid(): Boolean {
         val conn = connection ?: return false
+        if (cachedDeviceInfo?.uac1 == true) return true  // UAC1 has no clock entity
         val data = ByteArray(1)
 
         val detectedId = cachedDeviceInfo?.clockSourceId ?: -1
@@ -607,7 +631,8 @@ class UsbAudioDevice private constructor(private val context: Context) {
             val iface = device.getInterface(i)
             if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
                 iface.interfaceSubclass == 2 &&
-                iface.alternateSetting == altSetting) {
+                iface.alternateSetting == altSetting &&
+                (cachedDeviceInfo == null || iface.id == cachedDeviceInfo?.interfaceId)) {
                 val result = conn.setInterface(iface)
                 Log.i(TAG, "setAltSetting($altSetting) via Java API: $result " +
                         "(iface id=${iface.id}, endpoints=${iface.endpointCount})")

@@ -16,5 +16,7 @@ data class UsbAudioDeviceInfo(
     val altSettingCount: Int,
     val clockSourceId: Int,
     val bestAltSetting: Int,
-    val bestBitDepth: Int
+    val bestBitDepth: Int,
+    /** USB Audio Class 1 device (no Clock Source; the rate is set on the endpoint). */
+    val uac1: Boolean = false,
 )
